@@ -2,49 +2,73 @@ from __future__ import annotations
 
 import os
 import sys
-import json
-import math
 import datetime as dt
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any, List
 
 import numpy as np
 import pandas as pd
 import requests
 
-
 # -----------------------------
-# Config (可調整/替換資料源)
+# Config
 # -----------------------------
 TWSE_BASE = "https://openapi.twse.com.tw/v1"
-TPEX_BASE = "https://www.tpex.org.tw/openapi/v1"  # 若實際 base 不同，之後以回傳錯誤調整
+TPEX_BASE = "https://www.tpex.org.tw/openapi/v1"  # 可能需要再調，但本版已容錯
 
-# 嘗試抓「當日全市場行情」的端點（若端點不同，先讓程式輸出錯誤，便於我快速修正）
+# 端點
 TWSE_DAILY_ALL = f"{TWSE_BASE}/exchangeReport/STOCK_DAY_ALL"
+
+# TPEx 端點候選（任一成功即可）
 TPEX_DAILY_ALL_CANDIDATES = [
-    f"{TPEX_BASE}/tpex_mainboard_daily",   # 候選1（可能需調整）
-    f"{TPEX_BASE}/stock_aftertrading_daily_trading_info",  # 候選2（可能需調整）
+    f"{TPEX_BASE}/stock_aftertrading_daily_trading_info",
+    f"{TPEX_BASE}/tpex_mainboard_daily",
 ]
 
 HISTORY_PATH = "outputs/history_prices.csv"
 OUT_HTML = "docs/index.html"
 
-
-# -----------------------------
-# v7.9.9.1 核心參數（MVP 子集）
-# -----------------------------
-SDR_DAYS = 30
-SDR_MIN_RETURN = 0.05  # +5%
-E_STOP_MA = 20
+# v7.9.9.1 MVP 參數（技術面子集）
 E_DRAWDOWN = 0.08      # -8%
-CYCLE_DRAWDOWN = 0.12  # -12%
-GLOBAL_STOP = 0.12     # -12%
-CYCLE_MA = 240
-
-# 當資料不足時依 §11：不可放寬 → 進 Z
-MIN_HISTORY_FOR_MA240 = 240
-MIN_HISTORY_FOR_MA60 = 60
 MIN_HISTORY_FOR_MA20 = 20
+MIN_HISTORY_FOR_MA60 = 60
+MIN_HISTORY_FOR_MA240 = 240
+
+# 欄位別名對照：不同資料源命名不同，一律轉成統一欄位
+COLUMN_ALIASES = {
+    # 日期
+    "Date": "date",
+    "日期": "date",
+    # 代號/名稱
+    "code": "code",
+    "Code": "code",
+    "StockNo": "code",
+    "證券代號": "code",
+    "name": "name",
+    "Name": "name",
+    "證券名稱": "name",
+    # 成交量
+    "volume": "volume",
+    "Volume": "volume",
+    "成交量": "volume",
+    "成交股數": "volume",
+    # 收盤價
+    "close": "close",
+    "Close": "close",
+    "ClosingPrice": "close",
+    "收盤價": "close",
+    "收盤": "close",
+    # 開高低（備用）
+    "OpeningPrice": "open",
+    "HighestPrice": "high",
+    "LowestPrice": "low",
+    # 成交金額（備用）
+    "TradeValue": "trade_value",
+    # 漲跌（備用）
+    "Change": "change",
+    # 成交筆數（備用）
+    "Transaction": "transactions",
+}
 
 
 @dataclass
@@ -53,83 +77,116 @@ class FetchResult:
     source: str
     ok: bool
     error: Optional[str] = None
+    warn: Optional[str] = None
 
 
-def _http_get_json(url: str, timeout: int = 30) -> Tuple[bool, Optional[object], Optional[str]]:
+def _http_get(url: str, timeout: int = 30) -> Tuple[int, str, str]:
+    """
+    回傳 (status_code, content_type, text)
+    """
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "tw-stock-layers/1.1"})
+    ct = r.headers.get("content-type", "")
+    return r.status_code, ct, r.text
+
+
+def _try_parse_json(text: str) -> Tuple[bool, Optional[Any], Optional[str]]:
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "tw-stock-layers/1.0"})
-        if r.status_code != 200:
-            return False, None, f"HTTP {r.status_code}: {url}"
-        # 有些端點回 JSON，有些回 text/json；統一嘗試 json()
-        return True, r.json(), None
+        return True, requests.models.complexjson.loads(text), None
     except Exception as e:
         return False, None, f"{type(e).__name__}: {e}"
 
 
-def fetch_twse_daily_all() -> FetchResult:
-    ok, data, err = _http_get_json(TWSE_DAILY_ALL)
-    if not ok:
-        return FetchResult(pd.DataFrame(), "TWSE", False, err)
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    將不同來源欄位名稱統一成：date/code/name/close/volume/...
+    """
+    if df is None or df.empty:
+        return df
 
-    # 嘗試自動辨識欄位（不同端點可能欄名不同）
-    df = pd.DataFrame(data)
-    if df.empty:
-        return FetchResult(df, "TWSE", False, "TWSE returned empty dataset")
-
-    # 常見欄位猜測：Code/StockNo/證券代號, Name/證券名稱, Close/收盤價, Volume/成交股數
-    colmap = {}
+    new_cols = {}
     for c in df.columns:
-        lc = str(c).lower()
-        if "code" in lc or "stockno" in lc or "證券代號" in c:
-            colmap[c] = "code"
-        elif "name" in lc or "證券名稱" in c:
-            colmap[c] = "name"
-        elif "close" in lc or "收盤" in c:
-            colmap[c] = "close"
-        elif "volume" in lc or "成交股數" in c or "成交量" in c:
-            colmap[c] = "volume"
+        if c in COLUMN_ALIASES:
+            new_cols[c] = COLUMN_ALIASES[c]
+        else:
+            # 也嘗試以 lower 去對應
+            lc = str(c).strip()
+            if lc in COLUMN_ALIASES:
+                new_cols[c] = COLUMN_ALIASES[lc]
+            else:
+                new_cols[c] = c  # 保留原欄位（不影響核心）
+    df = df.rename(columns=new_cols)
 
-    df = df.rename(columns=colmap)
-    need = {"code", "close"}
-    if not need.issubset(df.columns):
-        return FetchResult(df, "TWSE", False, f"TWSE schema unexpected: columns={list(df.columns)[:30]}")
+    # code 一律字串
+    if "code" in df.columns:
+        df["code"] = df["code"].astype(str).str.strip()
 
-    df["market"] = "TWSE"
-    return FetchResult(df, "TWSE", True)
+    return df
+
+
+def fetch_twse_daily_all() -> FetchResult:
+    try:
+        status, ct, text = _http_get(TWSE_DAILY_ALL)
+        if status != 200:
+            return FetchResult(pd.DataFrame(), "TWSE", False, f"HTTP {status} from TWSE")
+
+        ok, data, jerr = _try_parse_json(text)
+        if not ok or data is None:
+            return FetchResult(pd.DataFrame(), "TWSE", False, f"TWSE JSON parse failed: {jerr}")
+
+        df = pd.DataFrame(data)
+        df = normalize_columns(df)
+
+        # 核心欄位檢核
+        if not {"code", "close"}.issubset(df.columns):
+            return FetchResult(df, "TWSE", False, f"TWSE missing required columns after normalize: {list(df.columns)[:30]}")
+
+        df["market"] = "TWSE"
+        return FetchResult(df, "TWSE", True)
+
+    except Exception as e:
+        return FetchResult(pd.DataFrame(), "TWSE", False, f"{type(e).__name__}: {e}")
 
 
 def fetch_tpex_daily_all() -> FetchResult:
+    last_warn = None
     last_err = None
+
     for url in TPEX_DAILY_ALL_CANDIDATES:
-        ok, data, err = _http_get_json(url)
-        if not ok:
-            last_err = err
+        try:
+            status, ct, text = _http_get(url)
+            if status != 200:
+                last_err = f"TPEX HTTP {status}: {url}"
+                continue
+
+            # 有些時候會回 HTML 或空字串
+            if text is None or len(text.strip()) == 0:
+                last_warn = f"TPEX empty response (likely blocked or no data): {url}"
+                continue
+
+            # 如果 content-type 不是 json，也先嘗試 parse；失敗就當容錯略過
+            ok, data, jerr = _try_parse_json(text)
+            if not ok or data is None:
+                # 容錯：記 warn，不中斷
+                snippet = text.strip()[:120].replace("\n", " ")
+                last_warn = f"TPEX non-JSON response: {url} ({jerr}); head='{snippet}'"
+                continue
+
+            df = pd.DataFrame(data)
+            df = normalize_columns(df)
+
+            if {"code", "close"}.issubset(df.columns):
+                df["market"] = "TPEx"
+                return FetchResult(df, "TPEx", True, warn=last_warn)
+            else:
+                last_warn = f"TPEX schema unexpected after normalize: {url}, columns={list(df.columns)[:30]}"
+                continue
+
+        except Exception as e:
+            last_err = f"TPEX exception: {type(e).__name__}: {e}"
             continue
-        df = pd.DataFrame(data)
-        if df.empty:
-            last_err = f"TPEX empty dataset: {url}"
-            continue
 
-        colmap = {}
-        for c in df.columns:
-            lc = str(c).lower()
-            if "code" in lc or "stock" in lc or "代號" in c:
-                colmap[c] = "code"
-            elif "name" in lc or "名稱" in c:
-                colmap[c] = "name"
-            elif "close" in lc or "收盤" in c:
-                colmap[c] = "close"
-            elif "volume" in lc or "成交" in c:
-                colmap[c] = "volume"
-
-        df = df.rename(columns=colmap)
-        if {"code", "close"}.issubset(df.columns):
-            df["market"] = "TPEx"
-            return FetchResult(df, "TPEx", True)
-
-        last_err = f"TPEX schema unexpected: {url}, columns={list(df.columns)[:30]}"
-
-    return FetchResult(pd.DataFrame(), "TPEx", False, last_err or "TPEX fetch failed")
+    # 這裡改成「ok=False 但不致命」：主流程會用 warning 呈現並繼續跑 TWSE
+    return FetchResult(pd.DataFrame(), "TPEx", False, error=last_err, warn=last_warn)
 
 
 def load_history() -> pd.DataFrame:
@@ -144,15 +201,14 @@ def load_history() -> pd.DataFrame:
 
 
 def append_today(history: pd.DataFrame, today_df: pd.DataFrame, today: pd.Timestamp) -> pd.DataFrame:
-    # 保留必要欄位
     keep = ["code", "market", "close"]
     if "volume" in today_df.columns:
         keep.append("volume")
+
     df = today_df[keep].copy()
     df["date"] = today
     df["code"] = df["code"].astype(str).str.strip()
 
-    # 去重（同日同股只留最後）
     out = pd.concat([history, df], ignore_index=True)
     out["date"] = pd.to_datetime(out["date"])
     out = out.drop_duplicates(subset=["date", "code", "market"], keep="last")
@@ -160,10 +216,12 @@ def append_today(history: pd.DataFrame, today_df: pd.DataFrame, today: pd.Timest
 
 
 def compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
-    # 以 (code, market) 分組計算 MA 與回落
     hist = hist.sort_values(["market", "code", "date"]).copy()
     hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
-    hist["volume"] = pd.to_numeric(hist.get("volume", np.nan), errors="coerce")
+    if "volume" in hist.columns:
+        hist["volume"] = pd.to_numeric(hist["volume"], errors="coerce")
+    else:
+        hist["volume"] = np.nan
 
     def _grp(g: pd.DataFrame) -> pd.DataFrame:
         g = g.copy()
@@ -177,15 +235,14 @@ def compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
     return hist.groupby(["market", "code"], group_keys=False).apply(_grp)
 
 
-def layer_logic(today_row: pd.Series, hist_tail: pd.DataFrame) -> Tuple[str, str]:
+def layer_logic(today_row: pd.Series) -> Tuple[str, str]:
     """
-    MVP 分層：
-    - 資料不足：Z（依 §11）
-    - E：今日收盤 > ma60 且 dd_from_hi > -8% 且 close > ma20（近似強勢短驗證）
-    - A/B/C/D：先用 ma240/ma60 作粗分（後續再把營收YoY、RS、量能等補齊）
-    - 循環股/金融股判定：MVP 暫不自動辨識（先留待下一步加產業分類）
+    MVP 分層（技術面子集）：
+    - MA 不足：Z（依 §11：缺值不放寬）
+    - 近似 E：收盤 > MA60 且 > MA20 且未回落 -8%
+    - B/C/D：以 MA240/MA60 粗分
+    - A：此 MVP 先保留空（待補 RS/營收/量能條件後再開）
     """
-    # 資料不足 → Z
     if pd.isna(today_row.get("ma60")) or pd.isna(today_row.get("ma240")) or pd.isna(today_row.get("ma20")):
         return "Z", "§11 資料不足：MA 不足，列觀察"
 
@@ -195,11 +252,9 @@ def layer_logic(today_row: pd.Series, hist_tail: pd.DataFrame) -> Tuple[str, str
     ma240 = float(today_row["ma240"])
     dd = float(today_row.get("dd_from_hi", 0.0))
 
-    # 近似 E（強動能短驗證）：站上 ma60、站上 ma20、未回落 -8%
     if close > ma60 and close > ma20 and dd > -E_DRAWDOWN:
         return "E", "近似E：收盤>MA60且>MA20且未回落-8%"
 
-    # 趨勢粗分
     if close > ma240 and close > ma60:
         return "B", "趨勢：收盤>MA240且>MA60（MVP）"
     if close > ma240 and close <= ma60:
@@ -210,7 +265,7 @@ def layer_logic(today_row: pd.Series, hist_tail: pd.DataFrame) -> Tuple[str, str
     return "Z", "弱勢：未達趨勢條件，列觀察（MVP）"
 
 
-def build_html_report(date_str: str, layers: pd.DataFrame, warnings: list[str], errors: list[str]) -> str:
+def build_html_report(date_str: str, layers: pd.DataFrame, warnings: List[str], errors: List[str]) -> str:
     def _table(df: pd.DataFrame, title: str) -> str:
         if df.empty:
             return f"<h2>{title}</h2><p>(空)</p>"
@@ -242,12 +297,11 @@ def build_html_report(date_str: str, layers: pd.DataFrame, warnings: list[str], 
             html.append(f"<li>{w}</li>")
         html.append("</ul>")
 
-    # 分層輸出
     for layer in ["A", "B", "C", "D", "E", "Z"]:
         df_layer = layers[layers["layer"] == layer].sort_values(["market", "code"])
         html.append(_table(df_layer, f"{layer} 層"))
 
-    html.append("<hr><p style='color:#666'>註：本版本為可上線 MVP。當歷史資料累積達 MA/量能/基本面需求後，分層將逐步符合 v7.9.9.1 全條文。</p>")
+    html.append("<hr><p style='color:#666'>註：本版本為可上線 MVP。MA/RS/營收/量能等資料補齊後，分層將逐步貼近 v7.9.9.1 全條文。</p>")
     html.append("</body></html>")
     return "\n".join(html)
 
@@ -259,19 +313,36 @@ def main() -> int:
     today = pd.Timestamp(dt.datetime.now().date())
     date_str = today.strftime("%Y-%m-%d")
 
-    errors: list[str] = []
-    warnings: list[str] = []
+    errors: List[str] = []
+    warnings: List[str] = []
 
     twse = fetch_twse_daily_all()
     if not twse.ok:
         errors.append(f"TWSE 取得失敗：{twse.error}")
+
     tpex = fetch_tpex_daily_all()
     if not tpex.ok:
-        errors.append(f"TPEx 取得失敗：{tpex.error}")
+        # TPEx 不致命：改成 warning（不讓整個流程掛掉）
+        if tpex.warn:
+            warnings.append(f"🟠 TPEx 取得異常：{tpex.warn}")
+        if tpex.error:
+            warnings.append(f"🟠 TPEx 例外：{tpex.error}")
+    else:
+        if tpex.warn:
+            warnings.append(f"🟡 TPEx 提示：{tpex.warn}")
 
-    daily = pd.concat([twse.df, tpex.df], ignore_index=True) if (twse.ok or tpex.ok) else pd.DataFrame()
+    # 合併資料（只要其中一個有資料就繼續）
+    frames = []
+    if twse.ok and not twse.df.empty:
+        frames.append(twse.df)
+    if tpex.ok and not tpex.df.empty:
+        frames.append(tpex.df)
+
+    daily = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if daily.empty:
-        html = build_html_report(date_str, pd.DataFrame(columns=["market","code","name","close","layer","reason"]), warnings, errors)
+        if not errors:
+            errors.append("今日資料為空（可能兩市場資料源皆暫時不可用）")
+        html = build_html_report(date_str, pd.DataFrame(columns=["market", "code", "name", "close", "layer", "reason"]), warnings, errors)
         with open(OUT_HTML, "w", encoding="utf-8") as f:
             f.write(html)
         return 0
@@ -283,7 +354,6 @@ def main() -> int:
 
     # 計算指標
     hist_ind = compute_indicators(hist)
-    # 取今日資料（含指標）
     today_ind = hist_ind[hist_ind["date"] == today].copy()
     if today_ind.empty:
         errors.append("今日指標資料為空（可能是日期格式或寫入失敗）")
@@ -291,7 +361,7 @@ def main() -> int:
     # 分層
     out_rows = []
     for _, row in today_ind.iterrows():
-        layer, reason = layer_logic(row, hist_ind)
+        layer, reason = layer_logic(row)
         out_rows.append({
             "market": row.get("market", ""),
             "code": str(row.get("code", "")).strip(),
@@ -302,12 +372,17 @@ def main() -> int:
         })
     layers = pd.DataFrame(out_rows)
 
-    # MVP 警示（先做工程級）
-    if any("取得失敗" in e for e in errors):
-        warnings.append("🟠 資料源部分失效：依 §11 降級，今日分層可能偏向 Z")
+    # MVP 警示
     z_ratio = (layers["layer"] == "Z").mean() if len(layers) else 1.0
     if z_ratio > 0.8:
-        warnings.append("🟡 Z 層占比偏高：歷史資料尚在累積（屬正常MVP階段）")
+        warnings.append("🟡 Z 層占比偏高：歷史資料尚在累積（符合 §11 缺值降級）")
+
+    if twse.ok and tpex.ok:
+        warnings.append("🟢 TWSE/TPEx 皆已取得（若 TPEx 為空屬正常時段差異）")
+    elif twse.ok and not tpex.ok:
+        warnings.append("🟠 今日僅 TWSE 可用：TPEx 依 §11 降級處理")
+    elif (not twse.ok) and tpex.ok:
+        warnings.append("🟠 今日僅 TPEx 可用：TWSE 依 §11 降級處理")
 
     # 產出 HTML
     html = build_html_report(date_str, layers, warnings, errors)
