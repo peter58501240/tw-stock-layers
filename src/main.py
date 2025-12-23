@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+BACKFILL_DAYS = 10  # 往前補 10 個交易日
+
 import os
 import sys
 import datetime as dt
