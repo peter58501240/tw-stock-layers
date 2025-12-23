@@ -1,0 +1,40 @@
+name: Daily Layer Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"   # 每天 18:00 Asia/Taipei（UTC+8）
+
+permissions:
+  contents: write
+
+jobs:
+  run-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scan
+        env:
+          TZ: Asia/Taipei
+        run: |
+          python src/main.py
+
+      - name: Commit and push outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html outputs || true
+          git commit -m "daily: update report" || echo "No changes"
+          git push
