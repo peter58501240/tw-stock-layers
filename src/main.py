@@ -125,11 +125,22 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def fetch_twse_daily_all() -> FetchResult:
+def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult:
+    """
+    取得 TWSE 全市場日資料。
+    若 for_date 有值，嘗試用 querystring 帶入日期（YYYYMMDD）。
+    取不到就回 ok=False 但不丟例外。
+    """
     try:
-        status, ct, text = _http_get(TWSE_DAILY_ALL)
+        url = TWSE_DAILY_ALL
+        if for_date is not None:
+            ymd = for_date.strftime("%Y%m%d")
+            # 嘗試常見參數名稱：date
+            url = f"{TWSE_DAILY_ALL}?date={ymd}"
+
+        status, ct, text = _http_get(url)
         if status != 200:
-            return FetchResult(pd.DataFrame(), "TWSE", False, f"HTTP {status} from TWSE")
+            return FetchResult(pd.DataFrame(), "TWSE", False, f"HTTP {status} from TWSE: {url}")
 
         ok, data, jerr = _try_parse_json(text)
         if not ok or data is None:
@@ -138,7 +149,6 @@ def fetch_twse_daily_all() -> FetchResult:
         df = pd.DataFrame(data)
         df = normalize_columns(df)
 
-        # 核心欄位檢核
         if not {"code", "close"}.issubset(df.columns):
             return FetchResult(df, "TWSE", False, f"TWSE missing required columns after normalize: {list(df.columns)[:30]}")
 
@@ -147,6 +157,45 @@ def fetch_twse_daily_all() -> FetchResult:
 
     except Exception as e:
         return FetchResult(pd.DataFrame(), "TWSE", False, f"{type(e).__name__}: {e}")
+
+    def backfill_twse_recent_days(history: pd.DataFrame, today: pd.Timestamp, days: int) -> Tuple[pd.DataFrame, list[str]]:
+    """
+    往前回補最近 days 個「交易日」的資料（以日為步進，抓不到就跳過）。
+    只回補 TWSE（TPEx 先不強求）。
+    """
+    notes = []
+    if days <= 0:
+        return history, notes
+
+    # 已經有資料的日期集合（TWSE）
+    have_dates = set(
+        pd.to_datetime(history.loc[history["market"] == "TWSE", "date"]).dt.date.astype(str).tolist()
+    ) if not history.empty else set()
+
+    filled = 0
+    # 往前最多掃 2*days 天（避免遇到連假完全補不到）
+    for i in range(1, days * 2 + 1):
+        d = today - pd.Timedelta(days=i)
+        d_key = d.date().isoformat()
+        if d_key in have_dates:
+            continue
+
+        r = fetch_twse_daily_all(d)
+        if not r.ok or r.df.empty:
+            continue
+
+        history = append_today(history, r.df, d)
+        have_dates.add(d_key)
+        filled += 1
+        if filled >= days:
+            break
+
+    if filled > 0:
+        notes.append(f"🟢 TWSE 已回補近 {filled} 個交易日（目標 {days}）")
+    else:
+        notes.append("🟠 TWSE 回補失敗：可能端點不支援 date 參數或被限制（仍可每日累積）")
+
+    return history, notes
 
 
 def fetch_tpex_daily_all() -> FetchResult:
@@ -351,8 +400,15 @@ def main() -> int:
 
     # 讀取/累積歷史
     hist = load_history()
-    hist = append_today(hist, daily, today)
-    hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
+
+# 若歷史不足，先回補最近 N 個交易日（TWSE）
+hist, bf_notes = backfill_twse_recent_days(hist, today, BACKFILL_DAYS)
+warnings.extend(bf_notes)
+
+# 再把今天資料寫入
+hist = append_today(hist, daily, today)
+hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
+
 
     # 計算指標
     hist_ind = compute_indicators(hist)
