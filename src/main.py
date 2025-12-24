@@ -99,8 +99,7 @@ def normalize_twse(df: pd.DataFrame) -> pd.DataFrame:
 # =============================
 def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult:
     """
-    取得 TWSE 全市場日資料。
-    初版：先用最新資料；回補會嘗試帶 date=YYYYMMDD（如果端點不支援會自動略過）
+    取得 TWSE 全市場日資料（MVP 寬鬆版）
     """
     try:
         url = TWSE_DAILY_ALL
@@ -110,7 +109,7 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
 
         status, ct, text = _http_get(url)
         if status != 200:
-            return FetchResult(pd.DataFrame(), "TWSE", False, f"HTTP {status} from TWSE: {url}")
+            return FetchResult(pd.DataFrame(), "TWSE", False, f"HTTP {status} from TWSE")
 
         ok, data, jerr = _try_parse_json(text)
         if not ok or data is None:
@@ -119,21 +118,20 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
         df = pd.DataFrame(data)
         df = normalize_twse(df)
 
-       # 寬鬆檢查：只要有「任何一個」價格欄位即可
-price_cols = {"close", "ClosingPrice", "收盤價", "收盤"}
-code_cols = {"code", "證券代號"}
+        # ===== MVP 寬鬆欄位檢查（重點在這）=====
+        price_cols = {"close", "ClosingPrice", "收盤價", "收盤"}
+        code_cols = {"code", "證券代號"}
 
-has_price = any(c in df.columns for c in price_cols)
-has_code = any(c in df.columns for c in code_cols)
+        has_price = any(c in df.columns for c in price_cols)
+        has_code = any(c in df.columns for c in code_cols)
 
-if not has_price or not has_code:
-    return FetchResult(
-        df,
-        "TWSE",
-        False,
-        f"TWSE 欄位不足（MVP 寬鬆模式）：{list(df.columns)[:20]}"
-    )
-
+        if not has_price or not has_code:
+            return FetchResult(
+                df,
+                "TWSE",
+                False,
+                f"TWSE 欄位不足（MVP）：{list(df.columns)[:20]}"
+            )
 
         return FetchResult(df, "TWSE", True)
 
