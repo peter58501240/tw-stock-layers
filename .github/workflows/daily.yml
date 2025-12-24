@@ -32,10 +32,17 @@ jobs:
           python src/main.py
 
       - name: Commit and push outputs
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
-          git add docs/index.html outputs || true
-          git commit -m "daily: update report" || echo "No changes"
-          git push
+  run: |
+    git config user.name "github-actions[bot]"
+    git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    # 先把產生的檔案 commit 掉
+    git add docs/index.html outputs || true
+    git commit -m "daily: update report" || echo "No changes to commit"
+
+    # 再拉遠端（允許自動 merge）
+    git pull --no-rebase --strategy-option theirs
+
+    # 最後推回去
+    git push
+
