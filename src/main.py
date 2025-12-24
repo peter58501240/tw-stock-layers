@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-BACKFILL_DAYS = 10  # 往前補 10 個交易日
+# 往前補 10 個交易日（可改 5~20；20 可讓 MA20 立刻成形）
+BACKFILL_DAYS = 10
 
 import os
-import sys
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Tuple, Any, List
@@ -16,12 +16,10 @@ import requests
 # Config
 # -----------------------------
 TWSE_BASE = "https://openapi.twse.com.tw/v1"
-TPEX_BASE = "https://www.tpex.org.tw/openapi/v1"  # 可能需要再調，但本版已容錯
+TPEX_BASE = "https://www.tpex.org.tw/openapi/v1"  # TPEx 不穩，先容錯
 
-# 端點
 TWSE_DAILY_ALL = f"{TWSE_BASE}/exchangeReport/STOCK_DAY_ALL"
 
-# TPEx 端點候選（任一成功即可）
 TPEX_DAILY_ALL_CANDIDATES = [
     f"{TPEX_BASE}/stock_aftertrading_daily_trading_info",
     f"{TPEX_BASE}/tpex_mainboard_daily",
@@ -36,39 +34,36 @@ MIN_HISTORY_FOR_MA20 = 20
 MIN_HISTORY_FOR_MA60 = 60
 MIN_HISTORY_FOR_MA240 = 240
 
-# 欄位別名對照：不同資料源命名不同，一律轉成統一欄位
 COLUMN_ALIASES = {
-    # 日期
     "Date": "date",
     "日期": "date",
-    # 代號/名稱
+
     "code": "code",
     "Code": "code",
     "StockNo": "code",
     "證券代號": "code",
+
     "name": "name",
     "Name": "name",
     "證券名稱": "name",
-    # 成交量
+
     "volume": "volume",
     "Volume": "volume",
     "成交量": "volume",
     "成交股數": "volume",
-    # 收盤價
+
     "close": "close",
     "Close": "close",
     "ClosingPrice": "close",
     "收盤價": "close",
     "收盤": "close",
-    # 開高低（備用）
+
     "OpeningPrice": "open",
     "HighestPrice": "high",
     "LowestPrice": "low",
-    # 成交金額（備用）
+
     "TradeValue": "trade_value",
-    # 漲跌（備用）
     "Change": "change",
-    # 成交筆數（備用）
     "Transaction": "transactions",
 }
 
@@ -83,10 +78,7 @@ class FetchResult:
 
 
 def _http_get(url: str, timeout: int = 30) -> Tuple[int, str, str]:
-    """
-    回傳 (status_code, content_type, text)
-    """
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "tw-stock-layers/1.1"})
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "tw-stock-layers/1.2"})
     ct = r.headers.get("content-type", "")
     return r.status_code, ct, r.text
 
@@ -99,9 +91,6 @@ def _try_parse_json(text: str) -> Tuple[bool, Optional[Any], Optional[str]]:
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    將不同來源欄位名稱統一成：date/code/name/close/volume/...
-    """
     if df is None or df.empty:
         return df
 
@@ -110,15 +99,13 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         if c in COLUMN_ALIASES:
             new_cols[c] = COLUMN_ALIASES[c]
         else:
-            # 也嘗試以 lower 去對應
             lc = str(c).strip()
             if lc in COLUMN_ALIASES:
                 new_cols[c] = COLUMN_ALIASES[lc]
             else:
-                new_cols[c] = c  # 保留原欄位（不影響核心）
+                new_cols[c] = c
     df = df.rename(columns=new_cols)
 
-    # code 一律字串
     if "code" in df.columns:
         df["code"] = df["code"].astype(str).str.strip()
 
@@ -128,14 +115,12 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult:
     """
     取得 TWSE 全市場日資料。
-    若 for_date 有值，嘗試用 querystring 帶入日期（YYYYMMDD）。
-    取不到就回 ok=False 但不丟例外。
+    若 for_date 有值，嘗試帶入 date=YYYYMMDD。
     """
     try:
         url = TWSE_DAILY_ALL
         if for_date is not None:
             ymd = for_date.strftime("%Y%m%d")
-            # 嘗試常見參數名稱：date
             url = f"{TWSE_DAILY_ALL}?date={ymd}"
 
         status, ct, text = _http_get(url)
@@ -158,45 +143,6 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
     except Exception as e:
         return FetchResult(pd.DataFrame(), "TWSE", False, f"{type(e).__name__}: {e}")
 
-    def backfill_twse_recent_days(history: pd.DataFrame, today: pd.Timestamp, days: int) -> Tuple[pd.DataFrame, list[str]]:
-    """
-    往前回補最近 days 個「交易日」的資料（以日為步進，抓不到就跳過）。
-    只回補 TWSE（TPEx 先不強求）。
-    """
-    notes = []
-    if days <= 0:
-        return history, notes
-
-    # 已經有資料的日期集合（TWSE）
-    have_dates = set(
-        pd.to_datetime(history.loc[history["market"] == "TWSE", "date"]).dt.date.astype(str).tolist()
-    ) if not history.empty else set()
-
-    filled = 0
-    # 往前最多掃 2*days 天（避免遇到連假完全補不到）
-    for i in range(1, days * 2 + 1):
-        d = today - pd.Timedelta(days=i)
-        d_key = d.date().isoformat()
-        if d_key in have_dates:
-            continue
-
-        r = fetch_twse_daily_all(d)
-        if not r.ok or r.df.empty:
-            continue
-
-        history = append_today(history, r.df, d)
-        have_dates.add(d_key)
-        filled += 1
-        if filled >= days:
-            break
-
-    if filled > 0:
-        notes.append(f"🟢 TWSE 已回補近 {filled} 個交易日（目標 {days}）")
-    else:
-        notes.append("🟠 TWSE 回補失敗：可能端點不支援 date 參數或被限制（仍可每日累積）")
-
-    return history, notes
-
 
 def fetch_tpex_daily_all() -> FetchResult:
     last_warn = None
@@ -209,15 +155,12 @@ def fetch_tpex_daily_all() -> FetchResult:
                 last_err = f"TPEX HTTP {status}: {url}"
                 continue
 
-            # 有些時候會回 HTML 或空字串
             if text is None or len(text.strip()) == 0:
                 last_warn = f"TPEX empty response (likely blocked or no data): {url}"
                 continue
 
-            # 如果 content-type 不是 json，也先嘗試 parse；失敗就當容錯略過
             ok, data, jerr = _try_parse_json(text)
             if not ok or data is None:
-                # 容錯：記 warn，不中斷
                 snippet = text.strip()[:120].replace("\n", " ")
                 last_warn = f"TPEX non-JSON response: {url} ({jerr}); head='{snippet}'"
                 continue
@@ -228,15 +171,12 @@ def fetch_tpex_daily_all() -> FetchResult:
             if {"code", "close"}.issubset(df.columns):
                 df["market"] = "TPEx"
                 return FetchResult(df, "TPEx", True, warn=last_warn)
-            else:
-                last_warn = f"TPEX schema unexpected after normalize: {url}, columns={list(df.columns)[:30]}"
-                continue
 
+            last_warn = f"TPEX schema unexpected after normalize: {url}, columns={list(df.columns)[:30]}"
         except Exception as e:
             last_err = f"TPEX exception: {type(e).__name__}: {e}"
             continue
 
-    # 這裡改成「ok=False 但不致命」：主流程會用 warning 呈現並繼續跑 TWSE
     return FetchResult(pd.DataFrame(), "TPEx", False, error=last_err, warn=last_warn)
 
 
@@ -251,19 +191,57 @@ def load_history() -> pd.DataFrame:
     return pd.DataFrame(columns=["date", "code", "market", "close", "volume"])
 
 
-def append_today(history: pd.DataFrame, today_df: pd.DataFrame, today: pd.Timestamp) -> pd.DataFrame:
+def append_today(history: pd.DataFrame, today_df: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
     keep = ["code", "market", "close"]
     if "volume" in today_df.columns:
         keep.append("volume")
 
     df = today_df[keep].copy()
-    df["date"] = today
+    df["date"] = day
     df["code"] = df["code"].astype(str).str.strip()
 
     out = pd.concat([history, df], ignore_index=True)
     out["date"] = pd.to_datetime(out["date"])
     out = out.drop_duplicates(subset=["date", "code", "market"], keep="last")
     return out
+
+
+def backfill_twse_recent_days(history: pd.DataFrame, today: pd.Timestamp, days: int) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    往前回補最近 days 個交易日資料（以日為步進，抓不到就跳過）。
+    只回補 TWSE（TPEx 先不強求）。
+    """
+    notes: List[str] = []
+    if days <= 0:
+        return history, notes
+
+    have_dates = set(
+        pd.to_datetime(history.loc[history["market"] == "TWSE", "date"]).dt.date.astype(str).tolist()
+    ) if not history.empty else set()
+
+    filled = 0
+    for i in range(1, days * 2 + 1):
+        d = today - pd.Timedelta(days=i)
+        d_key = d.date().isoformat()
+        if d_key in have_dates:
+            continue
+
+        r = fetch_twse_daily_all(d)
+        if (not r.ok) or r.df.empty:
+            continue
+
+        history = append_today(history, r.df, d)
+        have_dates.add(d_key)
+        filled += 1
+        if filled >= days:
+            break
+
+    if filled > 0:
+        notes.append(f"🟢 TWSE 已回補近 {filled} 個交易日（目標 {days}）")
+    else:
+        notes.append("🟠 TWSE 回補失敗：可能端點不支援 date 參數或被限制（仍可每日累積）")
+
+    return history, notes
 
 
 def compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
@@ -287,13 +265,6 @@ def compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
 
 
 def layer_logic(today_row: pd.Series) -> Tuple[str, str]:
-    """
-    MVP 分層（技術面子集）：
-    - MA 不足：Z（依 §11：缺值不放寬）
-    - 近似 E：收盤 > MA60 且 > MA20 且未回落 -8%
-    - B/C/D：以 MA240/MA60 粗分
-    - A：此 MVP 先保留空（待補 RS/營收/量能條件後再開）
-    """
     if pd.isna(today_row.get("ma60")) or pd.isna(today_row.get("ma240")) or pd.isna(today_row.get("ma20")):
         return "Z", "§11 資料不足：MA 不足，列觀察"
 
@@ -367,13 +338,12 @@ def main() -> int:
     errors: List[str] = []
     warnings: List[str] = []
 
-    twse = fetch_twse_daily_all()
+    twse = fetch_twse_daily_all(None)
     if not twse.ok:
         errors.append(f"TWSE 取得失敗：{twse.error}")
 
     tpex = fetch_tpex_daily_all()
     if not tpex.ok:
-        # TPEx 不致命：改成 warning（不讓整個流程掛掉）
         if tpex.warn:
             warnings.append(f"🟠 TPEx 取得異常：{tpex.warn}")
         if tpex.error:
@@ -382,7 +352,6 @@ def main() -> int:
         if tpex.warn:
             warnings.append(f"🟡 TPEx 提示：{tpex.warn}")
 
-    # 合併資料（只要其中一個有資料就繼續）
     frames = []
     if twse.ok and not twse.df.empty:
         frames.append(twse.df)
@@ -398,25 +367,21 @@ def main() -> int:
             f.write(html)
         return 0
 
-    # 讀取/累積歷史
     hist = load_history()
 
-# 若歷史不足，先回補最近 N 個交易日（TWSE）
-hist, bf_notes = backfill_twse_recent_days(hist, today, BACKFILL_DAYS)
-warnings.extend(bf_notes)
+    # 回補（加速 warm-up）
+    hist, bf_notes = backfill_twse_recent_days(hist, today, BACKFILL_DAYS)
+    warnings.extend(bf_notes)
 
-# 再把今天資料寫入
-hist = append_today(hist, daily, today)
-hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
+    # 今日寫入
+    hist = append_today(hist, daily, today)
+    hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
 
-
-    # 計算指標
     hist_ind = compute_indicators(hist)
     today_ind = hist_ind[hist_ind["date"] == today].copy()
     if today_ind.empty:
         errors.append("今日指標資料為空（可能是日期格式或寫入失敗）")
 
-    # 分層
     out_rows = []
     for _, row in today_ind.iterrows():
         layer, reason = layer_logic(row)
@@ -430,7 +395,6 @@ hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
         })
     layers = pd.DataFrame(out_rows)
 
-    # MVP 警示
     z_ratio = (layers["layer"] == "Z").mean() if len(layers) else 1.0
     if z_ratio > 0.8:
         warnings.append("🟡 Z 層占比偏高：歷史資料尚在累積（符合 §11 缺值降級）")
@@ -442,7 +406,6 @@ hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
     elif (not twse.ok) and tpex.ok:
         warnings.append("🟠 今日僅 TPEx 可用：TWSE 依 §11 降級處理")
 
-    # 產出 HTML
     html = build_html_report(date_str, layers, warnings, errors)
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
