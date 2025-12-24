@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # 往前補 10 個交易日（可改 5~20；20 可讓 MA20 立刻成形）
-BACKFILL_DAYS = 10
+BACKFILL_DAYS = 30
 
 import os
 import datetime as dt
