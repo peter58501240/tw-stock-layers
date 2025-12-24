@@ -3,7 +3,7 @@ name: Daily Layer Scan
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 10 * * *"   # 每天 18:00 Asia/Taipei（UTC+8）
+    - cron: "30 14 * * 1-5"  # 台北 22:30（UTC 14:30），週一到週五
 
 permissions:
   contents: write
@@ -11,6 +11,7 @@ permissions:
 jobs:
   run-scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,23 +27,20 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run scan
-        env:
-          TZ: Asia/Taipei
         run: |
           python src/main.py
 
       - name: Commit and push outputs
-  run: |
-    git config user.name "github-actions[bot]"
-    git config user.email "github-actions[bot]@users.noreply.github.com"
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-    # 先把產生的檔案 commit 掉
-    git add docs/index.html outputs || true
-    git commit -m "daily: update report" || echo "No changes to commit"
+          # 先 commit 產出
+          git add docs/index.html outputs || true
+          git commit -m "daily: update report" || echo "No changes to commit"
 
-    # 再拉遠端（允許自動 merge）
-    git pull --no-rebase --strategy-option theirs
+          # 再拉遠端（用 merge，不用 rebase）
+          git pull --no-rebase --strategy-option theirs
 
-    # 最後推回去
-    git push
-
+          # 推回 repo
+          git push
