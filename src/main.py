@@ -119,8 +119,21 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
         df = pd.DataFrame(data)
         df = normalize_twse(df)
 
-        if not {"code", "close"}.issubset(df.columns):
-            return FetchResult(df, "TWSE", False, f"TWSE missing required columns: {list(df.columns)[:30]}")
+       # 寬鬆檢查：只要有「任何一個」價格欄位即可
+price_cols = {"close", "ClosingPrice", "收盤價", "收盤"}
+code_cols = {"code", "證券代號"}
+
+has_price = any(c in df.columns for c in price_cols)
+has_code = any(c in df.columns for c in code_cols)
+
+if not has_price or not has_code:
+    return FetchResult(
+        df,
+        "TWSE",
+        False,
+        f"TWSE 欄位不足（MVP 寬鬆模式）：{list(df.columns)[:20]}"
+    )
+
 
         return FetchResult(df, "TWSE", True)
 
