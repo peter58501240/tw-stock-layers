@@ -1,8 +1,22 @@
 from __future__ import annotations
 
-# 往前補 10 個交易日（可改 5~20；20 可讓 MA20 立刻成形）
-BACKFILL_DAYS = 30
+# =============================
+# Config（初版：先讓你「看得到東西」）
+# =============================
+BACKFILL_DAYS = 30          # 往前補 30 天，保證 MA20 成形（遇到假日也夠）
+E_DRAWDOWN = 0.08           # 強勢股回落 -8% 內仍視為強勢（初版用）
+HISTORY_PATH = "outputs/history_prices.csv"
+OUT_HTML = "docs/index.html"
 
+TWSE_BASE = "https://openapi.twse.com.tw/v1"
+TWSE_DAILY_ALL = f"{TWSE_BASE}/exchangeReport/STOCK_DAY_ALL"
+
+# 初版：只做 MA5/10/20（不追求 MA60/MA240，否則要很長歷史）
+MA_WINDOWS = (5, 10, 20)
+
+# =============================
+# Imports
+# =============================
 import os
 import datetime as dt
 from dataclasses import dataclass
@@ -12,62 +26,10 @@ import numpy as np
 import pandas as pd
 import requests
 
-# -----------------------------
-# Config
-# -----------------------------
-TWSE_BASE = "https://openapi.twse.com.tw/v1"
-TPEX_BASE = "https://www.tpex.org.tw/openapi/v1"  # TPEx 不穩，先容錯
 
-TWSE_DAILY_ALL = f"{TWSE_BASE}/exchangeReport/STOCK_DAY_ALL"
-
-TPEX_DAILY_ALL_CANDIDATES = [
-    f"{TPEX_BASE}/stock_aftertrading_daily_trading_info",
-    f"{TPEX_BASE}/tpex_mainboard_daily",
-]
-
-HISTORY_PATH = "outputs/history_prices.csv"
-OUT_HTML = "docs/index.html"
-
-# v7.9.9.1 MVP 參數（技術面子集）
-E_DRAWDOWN = 0.08      # -8%
-MIN_HISTORY_FOR_MA20 = 20
-MIN_HISTORY_FOR_MA60 = 60
-MIN_HISTORY_FOR_MA240 = 240
-
-COLUMN_ALIASES = {
-    "Date": "date",
-    "日期": "date",
-
-    "code": "code",
-    "Code": "code",
-    "StockNo": "code",
-    "證券代號": "code",
-
-    "name": "name",
-    "Name": "name",
-    "證券名稱": "name",
-
-    "volume": "volume",
-    "Volume": "volume",
-    "成交量": "volume",
-    "成交股數": "volume",
-
-    "close": "close",
-    "Close": "close",
-    "ClosingPrice": "close",
-    "收盤價": "close",
-    "收盤": "close",
-
-    "OpeningPrice": "open",
-    "HighestPrice": "high",
-    "LowestPrice": "low",
-
-    "TradeValue": "trade_value",
-    "Change": "change",
-    "Transaction": "transactions",
-}
-
-
+# =============================
+# Data Structures
+# =============================
 @dataclass
 class FetchResult:
     df: pd.DataFrame
@@ -77,8 +39,11 @@ class FetchResult:
     warn: Optional[str] = None
 
 
+# =============================
+# Helpers
+# =============================
 def _http_get(url: str, timeout: int = 30) -> Tuple[int, str, str]:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "tw-stock-layers/1.2"})
+    r = requests.get(url, timeout=timeout, headers={"User-Agent": "tw-stock-layers/1.0"})
     ct = r.headers.get("content-type", "")
     return r.status_code, ct, r.text
 
@@ -90,32 +55,52 @@ def _try_parse_json(text: str) -> Tuple[bool, Optional[Any], Optional[str]]:
         return False, None, f"{type(e).__name__}: {e}"
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_twse(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    TWSE STOCK_DAY_ALL 常見欄位：
+    Date, code, name, volume, TradeValue, OpeningPrice, HighestPrice, LowestPrice, ClosingPrice, Change, Transaction
+    我們只需要 code/name/close/volume
+    """
     if df is None or df.empty:
         return df
 
-    new_cols = {}
-    for c in df.columns:
-        if c in COLUMN_ALIASES:
-            new_cols[c] = COLUMN_ALIASES[c]
-        else:
-            lc = str(c).strip()
-            if lc in COLUMN_ALIASES:
-                new_cols[c] = COLUMN_ALIASES[lc]
-            else:
-                new_cols[c] = c
-    df = df.rename(columns=new_cols)
+    # 欄位映射
+    col_map = {
+        "Date": "date",
+        "日期": "date",
+        "code": "code",
+        "證券代號": "code",
+        "name": "name",
+        "證券名稱": "name",
+        "volume": "volume",
+        "成交股數": "volume",
+        "ClosingPrice": "close",
+        "收盤價": "close",
+        "收盤": "close",
+    }
+    df = df.rename(columns={c: col_map.get(c, c) for c in df.columns})
 
+    # 清理 code
     if "code" in df.columns:
         df["code"] = df["code"].astype(str).str.strip()
 
+    # close/volume 轉數字
+    if "close" in df.columns:
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    df["market"] = "TWSE"
     return df
 
 
+# =============================
+# Fetch
+# =============================
 def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult:
     """
     取得 TWSE 全市場日資料。
-    若 for_date 有值，嘗試帶入 date=YYYYMMDD。
+    初版：先用最新資料；回補會嘗試帶 date=YYYYMMDD（如果端點不支援會自動略過）
     """
     try:
         url = TWSE_DAILY_ALL
@@ -132,54 +117,20 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
             return FetchResult(pd.DataFrame(), "TWSE", False, f"TWSE JSON parse failed: {jerr}")
 
         df = pd.DataFrame(data)
-        df = normalize_columns(df)
+        df = normalize_twse(df)
 
         if not {"code", "close"}.issubset(df.columns):
-            return FetchResult(df, "TWSE", False, f"TWSE missing required columns after normalize: {list(df.columns)[:30]}")
+            return FetchResult(df, "TWSE", False, f"TWSE missing required columns: {list(df.columns)[:30]}")
 
-        df["market"] = "TWSE"
         return FetchResult(df, "TWSE", True)
 
     except Exception as e:
         return FetchResult(pd.DataFrame(), "TWSE", False, f"{type(e).__name__}: {e}")
 
 
-def fetch_tpex_daily_all() -> FetchResult:
-    last_warn = None
-    last_err = None
-
-    for url in TPEX_DAILY_ALL_CANDIDATES:
-        try:
-            status, ct, text = _http_get(url)
-            if status != 200:
-                last_err = f"TPEX HTTP {status}: {url}"
-                continue
-
-            if text is None or len(text.strip()) == 0:
-                last_warn = f"TPEX empty response (likely blocked or no data): {url}"
-                continue
-
-            ok, data, jerr = _try_parse_json(text)
-            if not ok or data is None:
-                snippet = text.strip()[:120].replace("\n", " ")
-                last_warn = f"TPEX non-JSON response: {url} ({jerr}); head='{snippet}'"
-                continue
-
-            df = pd.DataFrame(data)
-            df = normalize_columns(df)
-
-            if {"code", "close"}.issubset(df.columns):
-                df["market"] = "TPEx"
-                return FetchResult(df, "TPEx", True, warn=last_warn)
-
-            last_warn = f"TPEX schema unexpected after normalize: {url}, columns={list(df.columns)[:30]}"
-        except Exception as e:
-            last_err = f"TPEX exception: {type(e).__name__}: {e}"
-            continue
-
-    return FetchResult(pd.DataFrame(), "TPEx", False, error=last_err, warn=last_warn)
-
-
+# =============================
+# History IO
+# =============================
 def load_history() -> pd.DataFrame:
     if os.path.exists(HISTORY_PATH):
         try:
@@ -188,15 +139,18 @@ def load_history() -> pd.DataFrame:
             return hist
         except Exception:
             pass
-    return pd.DataFrame(columns=["date", "code", "market", "close", "volume"])
+
+    return pd.DataFrame(columns=["date", "code", "market", "name", "close", "volume"])
 
 
-def append_today(history: pd.DataFrame, today_df: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
+def append_day(history: pd.DataFrame, day_df: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
     keep = ["code", "market", "close"]
-    if "volume" in today_df.columns:
+    if "name" in day_df.columns:
+        keep.append("name")
+    if "volume" in day_df.columns:
         keep.append("volume")
 
-    df = today_df[keep].copy()
+    df = day_df[keep].copy()
     df["date"] = day
     df["code"] = df["code"].astype(str).str.strip()
 
@@ -206,57 +160,55 @@ def append_today(history: pd.DataFrame, today_df: pd.DataFrame, day: pd.Timestam
     return out
 
 
-def backfill_twse_recent_days(history: pd.DataFrame, today: pd.Timestamp, days: int) -> Tuple[pd.DataFrame, List[str]]:
+def backfill_twse_recent_days(history: pd.DataFrame, today: pd.Timestamp, target_days: int) -> Tuple[pd.DataFrame, int]:
     """
-    往前回補最近 days 個交易日資料（以日為步進，抓不到就跳過）。
-    只回補 TWSE（TPEx 先不強求）。
+    往前補 target_days 個「可能的交易日」。
+    這裡用日曆往前掃（含假日），抓不到就跳過；直到補到 target_days 次成功為止。
     """
-    notes: List[str] = []
-    if days <= 0:
-        return history, notes
+    if target_days <= 0:
+        return history, 0
 
-    have_dates = set(
-        pd.to_datetime(history.loc[history["market"] == "TWSE", "date"]).dt.date.astype(str).tolist()
-    ) if not history.empty else set()
+    # 已有的日期集合（TWSE）
+    have_dates = set()
+    if not history.empty:
+        h = history[history["market"] == "TWSE"].copy()
+        if not h.empty:
+            have_dates = set(pd.to_datetime(h["date"]).dt.date.astype(str).tolist())
 
     filled = 0
-    for i in range(1, days * 2 + 1):
+    # 往前掃 target_days * 2，假日多也夠
+    for i in range(1, target_days * 3 + 1):
         d = today - pd.Timedelta(days=i)
         d_key = d.date().isoformat()
         if d_key in have_dates:
             continue
 
         r = fetch_twse_daily_all(d)
-        if (not r.ok) or r.df.empty:
+        if not r.ok or r.df.empty:
             continue
 
-        history = append_today(history, r.df, d)
+        history = append_day(history, r.df, d)
         have_dates.add(d_key)
         filled += 1
-        if filled >= days:
+        if filled >= target_days:
             break
 
-    if filled > 0:
-        notes.append(f"🟢 TWSE 已回補近 {filled} 個交易日（目標 {days}）")
-    else:
-        notes.append("🟠 TWSE 回補失敗：可能端點不支援 date 參數或被限制（仍可每日累積）")
-
-    return history, notes
+    return history, filled
 
 
+# =============================
+# Indicators（初版：MA5/10/20 + 回落）
+# =============================
 def compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
     hist = hist.sort_values(["market", "code", "date"]).copy()
     hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
-    if "volume" in hist.columns:
-        hist["volume"] = pd.to_numeric(hist["volume"], errors="coerce")
-    else:
-        hist["volume"] = np.nan
+    hist["volume"] = pd.to_numeric(hist.get("volume", np.nan), errors="coerce")
 
     def _grp(g: pd.DataFrame) -> pd.DataFrame:
         g = g.copy()
-        g["ma20"] = g["close"].rolling(MIN_HISTORY_FOR_MA20).mean()
-        g["ma60"] = g["close"].rolling(MIN_HISTORY_FOR_MA60).mean()
-        g["ma240"] = g["close"].rolling(MIN_HISTORY_FOR_MA240).mean()
+        g["ma5"] = g["close"].rolling(5).mean()
+        g["ma10"] = g["close"].rolling(10).mean()
+        g["ma20"] = g["close"].rolling(20).mean()
         g["hi_close"] = g["close"].cummax()
         g["dd_from_hi"] = g["close"] / g["hi_close"] - 1.0
         return g
@@ -264,29 +216,48 @@ def compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
     return hist.groupby(["market", "code"], group_keys=False).apply(_grp)
 
 
+# =============================
+# Layer Logic（初版：保證分層有東西）
+# =============================
 def layer_logic(today_row: pd.Series) -> Tuple[str, str]:
-    if pd.isna(today_row.get("ma60")) or pd.isna(today_row.get("ma240")) or pd.isna(today_row.get("ma20")):
-        return "Z", "§11 資料不足：MA 不足，列觀察"
+    """
+    初版分層（只用 MA5/10/20）：
+    - E：close > MA5/10/20 且 dd > -8%
+    - B：MA5 > MA10 > MA20（多頭排列）
+    - C：close > MA20（整理）
+    - D：close <= MA20（轉弱）
+    - Z：close 或 MA20 缺
+    """
+    close = pd.to_numeric(today_row.get("close"), errors="coerce")
+    if pd.isna(close):
+        return "Z", "資料不足：close 缺"
 
-    close = float(today_row["close"])
-    ma20 = float(today_row["ma20"])
-    ma60 = float(today_row["ma60"])
-    ma240 = float(today_row["ma240"])
-    dd = float(today_row.get("dd_from_hi", 0.0))
+    ma5 = pd.to_numeric(today_row.get("ma5"), errors="coerce")
+    ma10 = pd.to_numeric(today_row.get("ma10"), errors="coerce")
+    ma20 = pd.to_numeric(today_row.get("ma20"), errors="coerce")
 
-    if close > ma60 and close > ma20 and dd > -E_DRAWDOWN:
-        return "E", "近似E：收盤>MA60且>MA20且未回落-8%"
+    if pd.isna(ma20):
+        return "Z", "資料不足：MA20 未成形（初版）"
 
-    if close > ma240 and close > ma60:
-        return "B", "趨勢：收盤>MA240且>MA60（MVP）"
-    if close > ma240 and close <= ma60:
-        return "C", "回檔：收盤>MA240但≤MA60（MVP）"
-    if close <= ma240 and close > ma60:
-        return "D", "反彈：收盤≤MA240但>MA60（MVP）"
+    dd = pd.to_numeric(today_row.get("dd_from_hi"), errors="coerce")
+    if pd.isna(dd):
+        dd = 0.0
 
-    return "Z", "弱勢：未達趨勢條件，列觀察（MVP）"
+    if (not pd.isna(ma5)) and (not pd.isna(ma10)) and close > ma5 and close > ma10 and close > ma20 and dd > -E_DRAWDOWN:
+        return "E", "強勢：收盤>MA5/10/20 且未回落-8%（初版）"
+
+    if (not pd.isna(ma5)) and (not pd.isna(ma10)) and ma5 > ma10 > ma20:
+        return "B", "趨勢：MA5>MA10>MA20（初版）"
+
+    if close > ma20:
+        return "C", "整理：收盤>MA20（初版）"
+
+    return "D", "轉弱：收盤≤MA20（初版）"
 
 
+# =============================
+# Report HTML（摘要警示）
+# =============================
 def build_html_report(date_str: str, layers: pd.DataFrame, warnings: List[str], errors: List[str]) -> str:
     def _table(df: pd.DataFrame, title: str) -> str:
         if df.empty:
@@ -303,7 +274,15 @@ def build_html_report(date_str: str, layers: pd.DataFrame, warnings: List[str], 
     html.append("<!doctype html><html><head><meta charset='utf-8'>")
     html.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
     html.append("<title>TW Stock Layers - Daily</title>")
-    html.append("<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:24px;} table{border-collapse:collapse; width:100%;} th,td{border:1px solid #ddd; padding:8px;} th{background:#f5f5f5;}</style>")
+    html.append(
+        "<style>"
+        "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:24px;}"
+        "table{border-collapse:collapse; width:100%;}"
+        "th,td{border:1px solid #ddd; padding:8px;}"
+        "th{background:#f5f5f5;}"
+        ".pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#f2f2f2;margin-right:8px;}"
+        "</style>"
+    )
     html.append("</head><body>")
     html.append(f"<h1>每日分層報表</h1><p>日期：{date_str}（Asia/Taipei）</p>")
 
@@ -313,21 +292,29 @@ def build_html_report(date_str: str, layers: pd.DataFrame, warnings: List[str], 
             html.append(f"<li>{e}</li>")
         html.append("</ul>")
 
+    # 摘要警示（不要滿版）
     if warnings:
-        html.append("<h2>即時警示（MVP）</h2><ul>")
-        for w in warnings:
+        html.append("<h2>即時警示（摘要｜MVP）</h2><ul>")
+        for w in warnings[:8]:
             html.append(f"<li>{w}</li>")
+        if len(warnings) > 8:
+            html.append(f"<li>…另有 {len(warnings)-8} 則提示省略</li>")
         html.append("</ul>")
 
-    for layer in ["A", "B", "C", "D", "E", "Z"]:
+    # 分層
+    for layer in ["E", "B", "C", "D", "Z"]:
         df_layer = layers[layers["layer"] == layer].sort_values(["market", "code"])
         html.append(_table(df_layer, f"{layer} 層"))
 
-    html.append("<hr><p style='color:#666'>註：本版本為可上線 MVP。MA/RS/營收/量能等資料補齊後，分層將逐步貼近 v7.9.9.1 全條文。</p>")
+    html.append("<hr>")
+    html.append("<p style='color:#666'>註：初版先以 TWSE + MA5/10/20 讓分層「可用可看」。後續再逐步加入 TPEx、MA60/240、RS、營收與規則全文。</p>")
     html.append("</body></html>")
     return "\n".join(html)
 
 
+# =============================
+# Main
+# =============================
 def main() -> int:
     os.makedirs("docs", exist_ok=True)
     os.makedirs("outputs", exist_ok=True)
@@ -338,50 +325,44 @@ def main() -> int:
     errors: List[str] = []
     warnings: List[str] = []
 
+    # 1) 取 TWSE 今日資料
     twse = fetch_twse_daily_all(None)
-    if not twse.ok:
+    if not twse.ok or twse.df.empty:
         errors.append(f"TWSE 取得失敗：{twse.error}")
-
-    tpex = fetch_tpex_daily_all()
-    if not tpex.ok:
-        if tpex.warn:
-            warnings.append(f"🟠 TPEx 取得異常：{tpex.warn}")
-        if tpex.error:
-            warnings.append(f"🟠 TPEx 例外：{tpex.error}")
-    else:
-        if tpex.warn:
-            warnings.append(f"🟡 TPEx 提示：{tpex.warn}")
-
-    frames = []
-    if twse.ok and not twse.df.empty:
-        frames.append(twse.df)
-    if tpex.ok and not tpex.df.empty:
-        frames.append(tpex.df)
-
-    daily = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if daily.empty:
-        if not errors:
-            errors.append("今日資料為空（可能兩市場資料源皆暫時不可用）")
-        html = build_html_report(date_str, pd.DataFrame(columns=["market", "code", "name", "close", "layer", "reason"]), warnings, errors)
+        # 仍輸出空報表避免 Pages 空白
+        empty = pd.DataFrame(columns=["market", "code", "name", "close", "layer", "reason"])
+        html = build_html_report(date_str, empty, warnings, errors)
         with open(OUT_HTML, "w", encoding="utf-8") as f:
             f.write(html)
         return 0
 
+    warnings.append("🟢 MVP：目前只跑 TWSE（TPEx 暫停）")
+
+    # 2) 載入歷史
     hist = load_history()
 
-    # 回補（加速 warm-up）
-    hist, bf_notes = backfill_twse_recent_days(hist, today, BACKFILL_DAYS)
-    warnings.extend(bf_notes)
+    # 3) 回補歷史（加速 MA20 成形）
+    hist, filled = backfill_twse_recent_days(hist, today, BACKFILL_DAYS)
+    warnings.append(f"🟢 TWSE 回補：成功補到 {filled} 天（目標 {BACKFILL_DAYS}）")
 
-    # 今日寫入
-    hist = append_today(hist, daily, today)
+    # 4) 寫入今日
+    hist = append_day(hist, twse.df, today)
     hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
 
+    # 5) 算指標
     hist_ind = compute_indicators(hist)
+
+    # 6) 取今日切片
     today_ind = hist_ind[hist_ind["date"] == today].copy()
     if today_ind.empty:
-        errors.append("今日指標資料為空（可能是日期格式或寫入失敗）")
+        errors.append("今日指標資料為空（可能日期寫入失敗）")
+        empty = pd.DataFrame(columns=["market", "code", "name", "close", "layer", "reason"])
+        html = build_html_report(date_str, empty, warnings, errors)
+        with open(OUT_HTML, "w", encoding="utf-8") as f:
+            f.write(html)
+        return 0
 
+    # 7) 分層
     out_rows = []
     for _, row in today_ind.iterrows():
         layer, reason = layer_logic(row)
@@ -395,17 +376,11 @@ def main() -> int:
         })
     layers = pd.DataFrame(out_rows)
 
-    z_ratio = (layers["layer"] == "Z").mean() if len(layers) else 1.0
-    if z_ratio > 0.8:
-        warnings.append("🟡 Z 層占比偏高：歷史資料尚在累積（符合 §11 缺值降級）")
+    # 8) 摘要統計（讓你爽：一眼看到有沒有分層）
+    cnt = layers["layer"].value_counts().to_dict()
+    warnings.append("📊 分佈：" + " / ".join([f"{k}:{v}" for k, v in cnt.items()]))
 
-    if twse.ok and tpex.ok:
-        warnings.append("🟢 TWSE/TPEx 皆已取得（若 TPEx 為空屬正常時段差異）")
-    elif twse.ok and not tpex.ok:
-        warnings.append("🟠 今日僅 TWSE 可用：TPEx 依 §11 降級處理")
-    elif (not twse.ok) and tpex.ok:
-        warnings.append("🟠 今日僅 TPEx 可用：TWSE 依 §11 降級處理")
-
+    # 9) 輸出 HTML
     html = build_html_report(date_str, layers, warnings, errors)
     with open(OUT_HTML, "w", encoding="utf-8") as f:
         f.write(html)
