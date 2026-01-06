@@ -413,6 +413,8 @@ def main() -> int:
     # 回補：補足交易日數
     hist, backfill_errors = backfill_trading_days(hist, report_date, BACKFILL_TRADING_DAYS)
     if backfill_errors:
+        errors.append(f"回補失敗 {len(backfill_errors)} 次")
+
 :
         # 不要刷版：只摘要
         errors.append(f"TWSE 回補失敗 {len(backfill_errors)} 次（常見原因：休市/連假/交易所暫時擋）")
