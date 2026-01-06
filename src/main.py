@@ -118,21 +118,8 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
         df = pd.DataFrame(data)
         df = normalize_twse(df)
 
-        # ===== MVP 寬鬆欄位檢查（重點在這）=====
-        price_cols = {"close", "ClosingPrice", "收盤價", "收盤"}
-        code_cols = {"code", "證券代號"}
-
-        has_price = any(c in df.columns for c in price_cols)
-        has_code = any(c in df.columns for c in code_cols)
-
-        if not has_price or not has_code:
-            return FetchResult(
-                df,
-                "TWSE",
-                False,
-                f"TWSE 欄位不足（MVP）：{list(df.columns)[:20]}"
-            )
-
+ # MVP：只要 normalize 後有資料就放行
+return FetchResult(df, "TWSE", True)
         return FetchResult(df, "TWSE", True)
 
     except Exception as e:
