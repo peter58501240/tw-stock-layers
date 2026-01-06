@@ -112,13 +112,28 @@ def normalize_twse(raw: pd.DataFrame) -> pd.DataFrame:
     df = raw.copy()
 
     # 常見欄位名稱（TWSE openapi 有時大小寫不同）
-    code_col = _pick_first_col(df, ["code", "Code", "證券代號", "股票代號"])
-    name_col = _pick_first_col(df, ["name", "Name", "證券名稱", "股票名稱"])
-    close_col = _pick_first_col(df, ["close", "ClosingPrice", "收盤價", "收盤"])
-    vol_col = _pick_first_col(df, ["volume", "TradeVolume", "成交股數", "成交量"])
+    # 修正：增加更多可能的欄位名稱，包括大小寫變體
+    code_col = _pick_first_col(df, ["Code", "code", "證券代號", "股票代號", "StockCode"])
+    name_col = _pick_first_col(df, ["Name", "name", "證券名稱", "股票名稱", "CompanyName"])
+    
+    # 關鍵修正：收盤價可能有多種名稱
+    close_col = _pick_first_col(df, [
+        "ClosingPrice", "close", "Close", "收盤價", "收盤", 
+        "ClosingPrice", "Closing_Price", "price"
+    ])
+    
+    vol_col = _pick_first_col(df, [
+        "TradeVolume", "volume", "Volume", "成交股數", "成交量", 
+        "TradingVolume", "Trading_Volume"
+    ])
+
+    # 除錯：印出找到的欄位
+    print(f"[DEBUG] Found columns: code={code_col}, name={name_col}, close={close_col}, vol={vol_col}")
+    print(f"[DEBUG] Available columns: {list(df.columns)[:15]}")
 
     # 必要欄位：code / close（沒有就回傳空，讓上層判定 fail）
     if code_col is None or close_col is None:
+        print(f"[ERROR] Missing required columns! code_col={code_col}, close_col={close_col}")
         # 直接回傳原 df，讓 caller 做錯誤訊息
         return df
 
@@ -141,6 +156,8 @@ def normalize_twse(raw: pd.DataFrame) -> pd.DataFrame:
     # 去掉 code 空值與 close 空值
     out = out[(out["code"] != "") & (out["code"].notna())]
     out = out[out["close"].notna()]
+    
+    print(f"[DEBUG] Normalized {len(out)} stocks")
 
     return out.reset_index(drop=True)
 
