@@ -99,7 +99,7 @@ def normalize_twse(df: pd.DataFrame) -> pd.DataFrame:
 # =============================
 def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult:
     """
-    取得 TWSE 全市場日資料（MVP 寬鬆版）
+    取得 TWSE 全市場日資料（MVP：只求能跑出分層）
     """
     try:
         url = TWSE_DAILY_ALL
@@ -116,10 +116,11 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
             return FetchResult(pd.DataFrame(), "TWSE", False, f"TWSE JSON parse failed: {jerr}")
 
         df = pd.DataFrame(data)
+
+        # normalize_twse 會把欄位統一到 code/name/close 等
         df = normalize_twse(df)
 
- # MVP：只要 normalize 後有資料就放行
-return FetchResult(df, "TWSE", True)
+        # MVP：不做欄位嚴格檢查，先放行讓你看到 E/B/C/D
         return FetchResult(df, "TWSE", True)
 
     except Exception as e:
