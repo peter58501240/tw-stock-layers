@@ -1,23 +1,8 @@
 from __future__ import annotations
 
-# =============================
-# Config（初版：先讓你「看得到東西」）
-# =============================
-BACKFILL_DAYS = 30          # 往前補 30 天，保證 MA20 成形（遇到假日也夠）
-E_DRAWDOWN = 0.08           # 強勢股回落 -8% 內仍視為強勢（初版用）
-HISTORY_PATH = "outputs/history_prices.csv"
-OUT_HTML = "docs/index.html"
-
-TWSE_BASE = "https://openapi.twse.com.tw/v1"
-TWSE_DAILY_ALL = f"{TWSE_BASE}/exchangeReport/STOCK_DAY_ALL"
-
-# 初版：只做 MA5/10/20（不追求 MA60/MA240，否則要很長歷史）
-MA_WINDOWS = (5, 10, 20)
-
-# =============================
-# Imports
-# =============================
 import os
+import sys
+import json
 import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Tuple, Any, List
@@ -26,85 +11,154 @@ import numpy as np
 import pandas as pd
 import requests
 
+# =========================================
+# Config（你只需要改這裡）
+# =========================================
+BACKFILL_DAYS = 20  # 往前補 N 個交易日（建議 20：MA20 才會快成立）
+TZ = "Asia/Taipei"
 
-# =============================
+# 只做 TWSE（TPEx 先不處理，讓你先看到資料）
+TWSE_BASE = "https://openapi.twse.com.tw/v1"
+TWSE_DAILY_ALL = f"{TWSE_BASE}/exchangeReport/STOCK_DAY_ALL"
+
+OUTPUTS_DIR = "outputs"
+DOCS_DIR = "docs"
+HISTORY_CSV = os.path.join(OUTPUTS_DIR, "history_prices.csv")
+HTML_PATH_OUTPUTS = os.path.join(OUTPUTS_DIR, "index.html")
+HTML_PATH_DOCS = os.path.join(DOCS_DIR, "index.html")
+
+
+# =========================================
 # Data Structures
-# =============================
+# =========================================
 @dataclass
 class FetchResult:
     df: pd.DataFrame
     source: str
     ok: bool
     error: Optional[str] = None
-    warn: Optional[str] = None
 
 
-# =============================
+# =========================================
 # Helpers
-# =============================
+# =========================================
+def _now_taipei_date() -> dt.date:
+    # GitHub runner 用 UTC，這裡粗略用 UTC+8 換算
+    now_utc = dt.datetime.utcnow()
+    now_tw = now_utc + dt.timedelta(hours=8)
+    return now_tw.date()
+
+
+def _is_weekend(d: dt.date) -> bool:
+    return d.weekday() >= 5  # 5=Sat, 6=Sun
+
+
+def _iter_prev_days(start: dt.date, n: int) -> List[dt.date]:
+    """回傳從 start 往前數 n 個「日曆日」，並在 fetch 時跳過週末（交易所休市也會被 fetch 失敗略過）。"""
+    out = []
+    cur = start
+    while len(out) < n:
+        cur = cur - dt.timedelta(days=1)
+        out.append(cur)
+    return out
+
+
 def _http_get(url: str, timeout: int = 30) -> Tuple[int, str, str]:
-    r = requests.get(url, timeout=timeout, headers={"User-Agent": "tw-stock-layers/1.0"})
-    ct = r.headers.get("content-type", "")
-    return r.status_code, ct, r.text
+    headers = {
+        "User-Agent": "Mozilla/5.0 (GitHub Actions; tw-stock-layers)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    r = requests.get(url, headers=headers, timeout=timeout)
+    return r.status_code, r.headers.get("content-type", ""), r.text
 
 
-def _try_parse_json(text: str) -> Tuple[bool, Optional[Any], Optional[str]]:
+def _try_parse_json(text: str) -> Tuple[bool, Any, Optional[str]]:
     try:
-        return True, requests.models.complexjson.loads(text), None
+        return True, json.loads(text), None
     except Exception as e:
         return False, None, f"{type(e).__name__}: {e}"
 
 
-def normalize_twse(df: pd.DataFrame) -> pd.DataFrame:
+def _pick_first_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = set(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    # 也做大小寫寬鬆匹配
+    lower_map = {str(c).lower(): c for c in df.columns}
+    for c in candidates:
+        lc = c.lower()
+        if lc in lower_map:
+            return lower_map[lc]
+    return None
+
+
+def _to_float_series(s: pd.Series) -> pd.Series:
+    # 把可能含逗號、空白的字串轉成 float
+    s2 = s.astype(str).str.replace(",", "", regex=False).str.strip()
+    s2 = s2.replace({"--": np.nan, "nan": np.nan, "None": np.nan, "": np.nan})
+    return pd.to_numeric(s2, errors="coerce")
+
+
+def normalize_twse(raw: pd.DataFrame) -> pd.DataFrame:
     """
-    TWSE STOCK_DAY_ALL 常見欄位：
-    Date, code, name, volume, TradeValue, OpeningPrice, HighestPrice, LowestPrice, ClosingPrice, Change, Transaction
-    我們只需要 code/name/close/volume
+    把 TWSE STOCK_DAY_ALL 回傳欄位統一為：
+      - code (str)
+      - name (str)
+      - close (float)
+      - volume (float)  # 單位不強求，先用來做量能/留欄
+      - market = "TWSE"
     """
-    if df is None or df.empty:
+    df = raw.copy()
+
+    # 常見欄位名稱（TWSE openapi 有時大小寫不同）
+    code_col = _pick_first_col(df, ["code", "Code", "證券代號", "股票代號"])
+    name_col = _pick_first_col(df, ["name", "Name", "證券名稱", "股票名稱"])
+    close_col = _pick_first_col(df, ["close", "ClosingPrice", "收盤價", "收盤"])
+    vol_col = _pick_first_col(df, ["volume", "TradeVolume", "成交股數", "成交量"])
+
+    # 必要欄位：code / close（沒有就回傳空，讓上層判定 fail）
+    if code_col is None or close_col is None:
+        # 直接回傳原 df，讓 caller 做錯誤訊息
         return df
 
-    # 欄位映射
-    col_map = {
-        "Date": "date",
-        "日期": "date",
-        "code": "code",
-        "證券代號": "code",
-        "name": "name",
-        "證券名稱": "name",
-        "volume": "volume",
-        "成交股數": "volume",
-        "ClosingPrice": "close",
-        "收盤價": "close",
-        "收盤": "close",
-    }
-    df = df.rename(columns={c: col_map.get(c, c) for c in df.columns})
+    out = pd.DataFrame()
+    out["code"] = df[code_col].astype(str).str.strip()
+    if name_col is not None:
+        out["name"] = df[name_col].astype(str).str.strip()
+    else:
+        out["name"] = ""
 
-    # 清理 code
-    if "code" in df.columns:
-        df["code"] = df["code"].astype(str).str.strip()
+    out["close"] = _to_float_series(df[close_col])
 
-    # close/volume 轉數字
-    if "close" in df.columns:
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+    if vol_col is not None:
+        out["volume"] = _to_float_series(df[vol_col])
+    else:
+        out["volume"] = np.nan
 
-    df["market"] = "TWSE"
-    return df
+    out["market"] = "TWSE"
+
+    # 去掉 code 空值與 close 空值
+    out = out[(out["code"] != "") & (out["code"].notna())]
+    out = out[out["close"].notna()]
+
+    return out.reset_index(drop=True)
 
 
-# =============================
+# =========================================
 # Fetch
-# =============================
+# =========================================
 def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult:
     """
-    取得 TWSE 全市場日資料（MVP：只求能跑出分層）
+    取得 TWSE 全市場日資料。
+    這支 openapi 可能不支援 date 參數；若不支援，仍會回傳「最新」。
+    我們採用：若 date 參數無效，回補可能會取到相同資料 -> 但仍可先讓 MA 跑起來（MVP）。
     """
     try:
         url = TWSE_DAILY_ALL
         if for_date is not None:
             ymd = for_date.strftime("%Y%m%d")
+            # 若 API 不吃 date，也不會壞，只是回傳最新
             url = f"{TWSE_DAILY_ALL}?date={ymd}"
 
         status, ct, text = _http_get(url)
@@ -115,275 +169,372 @@ def fetch_twse_daily_all(for_date: Optional[pd.Timestamp] = None) -> FetchResult
         if not ok or data is None:
             return FetchResult(pd.DataFrame(), "TWSE", False, f"TWSE JSON parse failed: {jerr}")
 
-        df = pd.DataFrame(data)
+        raw = pd.DataFrame(data)
+        df = normalize_twse(raw)
 
-        # normalize_twse 會把欄位統一到 code/name/close 等
-        df = normalize_twse(df)
+        # normalize 失敗：把欄位清單帶出來
+        if not {"code", "close"}.issubset(set(df.columns)):
+            return FetchResult(
+                raw,
+                "TWSE",
+                False,
+                f"TWSE normalize failed; columns={list(raw.columns)[:30]}",
+            )
 
-        # MVP：不做欄位嚴格檢查，先放行讓你看到 E/B/C/D
         return FetchResult(df, "TWSE", True)
 
     except Exception as e:
         return FetchResult(pd.DataFrame(), "TWSE", False, f"{type(e).__name__}: {e}")
 
 
-# =============================
-# History IO
-# =============================
-def load_history() -> pd.DataFrame:
-    if os.path.exists(HISTORY_PATH):
-        try:
-            hist = pd.read_csv(HISTORY_PATH, dtype={"code": str})
-            hist["date"] = pd.to_datetime(hist["date"])
-            return hist
-        except Exception:
-            pass
-
-    return pd.DataFrame(columns=["date", "code", "market", "name", "close", "volume"])
-
-
+# =========================================
+# History / Backfill
+# =========================================
 def append_day(history: pd.DataFrame, day_df: pd.DataFrame, day: pd.Timestamp) -> pd.DataFrame:
-    keep = ["code", "market", "close"]
-    if "name" in day_df.columns:
-        keep.append("name")
-    if "volume" in day_df.columns:
-        keep.append("volume")
+    """
+    把當日資料 append 進 history，並強制欄位齊全：date/code/name/close/volume/market
+    """
+    if day_df is None or len(day_df) == 0:
+        return history
 
-    df = day_df[keep].copy()
+    df = day_df.copy()
+
+    # 容錯：確保必要欄位存在
+    for col in ["code", "name", "close"]:
+        if col not in df.columns:
+            # 代表 normalize 沒成功或你傳進來不是 normalize 後資料
+            return history
+
+    if "volume" not in df.columns:
+        df["volume"] = np.nan
+    if "market" not in df.columns:
+        df["market"] = "TWSE"
+
     df["date"] = day
     df["code"] = df["code"].astype(str).str.strip()
+    df["name"] = df["name"].astype(str)
+
+    keep = ["date", "code", "name", "close", "volume", "market"]
+    df = df[keep].copy()
 
     out = pd.concat([history, df], ignore_index=True)
+
+    # 去重：同一日同一 code 只留一筆
     out["date"] = pd.to_datetime(out["date"])
-    out = out.drop_duplicates(subset=["date", "code", "market"], keep="last")
+    out = out.drop_duplicates(subset=["date", "code"], keep="last").reset_index(drop=True)
     return out
 
 
-def backfill_twse_recent_days(history: pd.DataFrame, today: pd.Timestamp, target_days: int) -> Tuple[pd.DataFrame, int]:
+def backfill_twse_recent_days(history: pd.DataFrame, today: pd.Timestamp, days: int) -> Tuple[pd.DataFrame, List[str]]:
     """
-    往前補 target_days 個「可能的交易日」。
-    這裡用日曆往前掃（含假日），抓不到就跳過；直到補到 target_days 次成功為止。
+    往前補 days 個「日曆日」嘗試抓資料：
+    - 週末跳過
+    - 抓不到就略過
     """
-    if target_days <= 0:
-        return history, 0
+    errors: List[str] = []
+    out = history.copy()
 
-    # 已有的日期集合（TWSE）
-    have_dates = set()
-    if not history.empty:
-        h = history[history["market"] == "TWSE"].copy()
-        if not h.empty:
-            have_dates = set(pd.to_datetime(h["date"]).dt.date.astype(str).tolist())
-
-    filled = 0
-    # 往前掃 target_days * 2，假日多也夠
-    for i in range(1, target_days * 3 + 1):
-        d = today - pd.Timedelta(days=i)
-        d_key = d.date().isoformat()
-        if d_key in have_dates:
+    candidates = _iter_prev_days(today.date(), days)
+    for d in reversed(candidates):
+        if _is_weekend(d):
             continue
 
-        r = fetch_twse_daily_all(d)
-        if not r.ok or r.df.empty:
+        ts = pd.Timestamp(d)
+        r = fetch_twse_daily_all(ts)
+        if not r.ok:
+            errors.append(f"TWSE {d} fetch failed: {r.error}")
             continue
 
-        history = append_day(history, r.df, d)
-        have_dates.add(d_key)
-        filled += 1
-        if filled >= target_days:
-            break
+        # 如果 API 不吃 date，會一直回最新 -> 仍 append，但會因 date 不同而形成假歷史
+        # MVP 階段先接受，之後再改成真正歷史來源（例如 TWSE CSV 舊資料或其他 provider）
+        out = append_day(out, r.df, ts)
 
-    return history, filled
+    return out, errors
 
 
-# =============================
-# Indicators（初版：MA5/10/20 + 回落）
-# =============================
-def compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
-    hist = hist.sort_values(["market", "code", "date"]).copy()
-    hist["close"] = pd.to_numeric(hist["close"], errors="coerce")
-    hist["volume"] = pd.to_numeric(hist.get("volume", np.nan), errors="coerce")
-
-    def _grp(g: pd.DataFrame) -> pd.DataFrame:
-        g = g.copy()
-        g["ma5"] = g["close"].rolling(5).mean()
-        g["ma10"] = g["close"].rolling(10).mean()
-        g["ma20"] = g["close"].rolling(20).mean()
-        g["hi_close"] = g["close"].cummax()
-        g["dd_from_hi"] = g["close"] / g["hi_close"] - 1.0
-        return g
-
-    return hist.groupby(["market", "code"], group_keys=False).apply(_grp)
+def load_history() -> pd.DataFrame:
+    if os.path.exists(HISTORY_CSV):
+        try:
+            df = pd.read_csv(HISTORY_CSV)
+            df["date"] = pd.to_datetime(df["date"])
+            return df
+        except Exception:
+            return pd.DataFrame(columns=["date", "code", "name", "close", "volume", "market"])
+    return pd.DataFrame(columns=["date", "code", "name", "close", "volume", "market"])
 
 
-# =============================
-# Layer Logic（初版：保證分層有東西）
-# =============================
-def layer_logic(today_row: pd.Series) -> Tuple[str, str]:
+def save_history(df: pd.DataFrame) -> None:
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    df2 = df.copy()
+    df2["date"] = pd.to_datetime(df2["date"]).dt.strftime("%Y-%m-%d")
+    df2.to_csv(HISTORY_CSV, index=False, encoding="utf-8")
+
+
+# =========================================
+# Layering (MVP)
+# =========================================
+def compute_mas(history: pd.DataFrame) -> pd.DataFrame:
     """
-    初版分層（只用 MA5/10/20）：
-    - E：close > MA5/10/20 且 dd > -8%
-    - B：MA5 > MA10 > MA20（多頭排列）
-    - C：close > MA20（整理）
-    - D：close <= MA20（轉弱）
-    - Z：close 或 MA20 缺
+    以每檔股票的 close 計算 MA5/10/20。
     """
-    close = pd.to_numeric(today_row.get("close"), errors="coerce")
-    if pd.isna(close):
-        return "Z", "資料不足：close 缺"
+    df = history.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["code", "date"]).reset_index(drop=True)
 
-    ma5 = pd.to_numeric(today_row.get("ma5"), errors="coerce")
-    ma10 = pd.to_numeric(today_row.get("ma10"), errors="coerce")
-    ma20 = pd.to_numeric(today_row.get("ma20"), errors="coerce")
+    for w in [5, 10, 20]:
+        df[f"ma{w}"] = df.groupby("code")["close"].transform(lambda s: s.rolling(w).mean())
 
-    if pd.isna(ma20):
-        return "Z", "資料不足：MA20 未成形（初版）"
-
-    dd = pd.to_numeric(today_row.get("dd_from_hi"), errors="coerce")
-    if pd.isna(dd):
-        dd = 0.0
-
-    if (not pd.isna(ma5)) and (not pd.isna(ma10)) and close > ma5 and close > ma10 and close > ma20 and dd > -E_DRAWDOWN:
-        return "E", "強勢：收盤>MA5/10/20 且未回落-8%（初版）"
-
-    if (not pd.isna(ma5)) and (not pd.isna(ma10)) and ma5 > ma10 > ma20:
-        return "B", "趨勢：MA5>MA10>MA20（初版）"
-
-    if close > ma20:
-        return "C", "整理：收盤>MA20（初版）"
-
-    return "D", "轉弱：收盤≤MA20（初版）"
+    return df
 
 
-# =============================
-# Report HTML（摘要警示）
-# =============================
-def build_html_report(date_str: str, layers: pd.DataFrame, warnings: List[str], errors: List[str]) -> str:
-    def _table(df: pd.DataFrame, title: str) -> str:
-        if df.empty:
-            return f"<h2>{title}</h2><p>(空)</p>"
-        cols = ["market", "code", "name", "close", "layer", "reason"]
-        df2 = df.copy()
-        for c in cols:
-            if c not in df2.columns:
-                df2[c] = ""
-        df2 = df2[cols]
-        return f"<h2>{title}</h2>" + df2.to_html(index=False, escape=True)
+def layer_today(history_ma: pd.DataFrame, today: pd.Timestamp) -> Tuple[dict, dict]:
+    """
+    只用 MA5/10/20 做 MVP 分層：
+      - WARMUP：ma20 不足（不算 Z）
+      - E：close > ma5 > ma10 > ma20
+      - B：close > ma5 > ma10 且 close >= ma20
+      - C：close > ma10 且 close >= ma20
+      - D：close > ma20
+      - Z：其餘
+    """
+    df = history_ma.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    day_df = df[df["date"] == today].copy()
 
-    html = []
-    html.append("<!doctype html><html><head><meta charset='utf-8'>")
-    html.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
-    html.append("<title>TW Stock Layers - Daily</title>")
-    html.append(
-        "<style>"
-        "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; margin:24px;}"
-        "table{border-collapse:collapse; width:100%;}"
-        "th,td{border:1px solid #ddd; padding:8px;}"
-        "th{background:#f5f5f5;}"
-        ".pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#f2f2f2;margin-right:8px;}"
-        "</style>"
+    if len(day_df) == 0:
+        return {}, {"summary": "今日無資料（可能是 API 當天未更新或回補沒成功）"}
+
+    # 最新一天每股一筆
+    day_df = day_df.sort_values(["code"]).drop_duplicates(subset=["code"], keep="last")
+
+    # warmup
+    warmup = day_df[day_df["ma20"].isna()].copy()
+    ready = day_df[day_df["ma20"].notna()].copy()
+
+    def _mk_list(x: pd.DataFrame) -> List[dict]:
+        x = x.copy()
+        x["name"] = x["name"].fillna("")
+        return x[["code", "name", "close", "ma5", "ma10", "ma20"]].to_dict(orient="records")
+
+    E = ready[(ready["close"] > ready["ma5"])_jobsafe(ready, "ma5") &
+              (ready["ma5"] > ready["ma10"])_jobsafe(ready, "ma10") &
+              (ready["ma10"] > ready["ma20"])_jobsafe(ready, "ma20")].copy()
+
+    # 上面那段如果遇到 nan 會出 warning；我們用函數避免
+    # 但 pandas 無法直接用自定義運算子，所以下面改用更安全的寫法
+    E = ready[
+        (ready["close"] > ready["ma5"]) &
+        (ready["ma5"] > ready["ma10"]) &
+        (ready["ma10"] > ready["ma20"])
+    ].copy()
+
+    B = ready[
+        (ready["close"] > ready["ma5"]) &
+        (ready["ma5"] > ready["ma10"]) &
+        (ready["close"] >= ready["ma20"]) &
+        (~ready["code"].isin(E["code"]))
+    ].copy()
+
+    C = ready[
+        (ready["close"] > ready["ma10"]) &
+        (ready["close"] >= ready["ma20"]) &
+        (~ready["code"].isin(E["code"])) &
+        (~ready["code"].isin(B["code"]))
+    ].copy()
+
+    D = ready[
+        (ready["close"] > ready["ma20"]) &
+        (~ready["code"].isin(E["code"])) &
+        (~ready["code"].isin(B["code"])) &
+        (~ready["code"].isin(C["code"]))
+    ].copy()
+
+    Z = ready[
+        (~ready["code"].isin(E["code"])) &
+        (~ready["code"].isin(B["code"])) &
+        (~ready["code"].isin(C["code"])) &
+        (~ready["code"].isin(D["code"]))
+    ].copy()
+
+    layers = {
+        "WARMUP": _mk_list(warmup),
+        "E": _mk_list(E),
+        "B": _mk_list(B),
+        "C": _mk_list(C),
+        "D": _mk_list(D),
+        "Z": _mk_list(Z),
+    }
+
+    meta = {
+        "summary": f"分佈：WARMUP {len(warmup)} / E {len(E)} / B {len(B)} / C {len(C)} / D {len(D)} / Z {len(Z)}"
+    }
+    return layers, meta
+
+
+# =========================================
+# HTML
+# =========================================
+def _fmt_row(r: dict) -> str:
+    code = r.get("code", "")
+    name = r.get("name", "")
+    close = r.get("close", np.nan)
+    ma5 = r.get("ma5", np.nan)
+    ma10 = r.get("ma10", np.nan)
+    ma20 = r.get("ma20", np.nan)
+
+    def f(x):
+        return "" if pd.isna(x) else f"{float(x):.2f}"
+
+    title = f"{name} ({code})" if name else f"{code}"
+    return (
+        f"<tr>"
+        f"<td>{title}</td>"
+        f"<td style='text-align:right'>{f(close)}</td>"
+        f"<td style='text-align:right'>{f(ma5)}</td>"
+        f"<td style='text-align:right'>{f(ma10)}</td>"
+        f"<td style='text-align:right'>{f(ma20)}</td>"
+        f"</tr>"
     )
-    html.append("</head><body>")
-    html.append(f"<h1>每日分層報表</h1><p>日期：{date_str}（Asia/Taipei）</p>")
 
+
+def render_html(report_date: dt.date, errors: List[str], layers: dict, meta: dict) -> str:
+    err_html = ""
     if errors:
-        html.append("<h2>抓取錯誤</h2><ul>")
-        for e in errors:
-            html.append(f"<li>{e}</li>")
-        html.append("</ul>")
+        items = "".join([f"<li>{e}</li>" for e in errors[:20]])
+        more = ""
+        if len(errors) > 20:
+            more = f"<div style='margin-top:6px;color:#666'>（其餘 {len(errors)-20} 筆略）</div>"
+        err_html = f"""
+        <h2>即時警示（摘要｜MVP）</h2>
+        <ul>{items}</ul>
+        {more}
+        """
+    else:
+        err_html = f"""
+        <h2>即時警示（摘要｜MVP）</h2>
+        <ul>
+          <li>🟢 目前只跑 TWSE（TPEx 暫停）</li>
+          <li>🟢 {meta.get("summary","")}</li>
+        </ul>
+        """
 
-    # 摘要警示（不要滿版）
-    if warnings:
-        html.append("<h2>即時警示（摘要｜MVP）</h2><ul>")
-        for w in warnings[:8]:
-            html.append(f"<li>{w}</li>")
-        if len(warnings) > 8:
-            html.append(f"<li>…另有 {len(warnings)-8} 則提示省略</li>")
-        html.append("</ul>")
+    def section(title: str, key: str) -> str:
+        rows = layers.get(key, [])
+        if not rows:
+            body = "<div>(空)</div>"
+        else:
+            trs = "\n".join(_fmt_row(r) for r in rows[:200])
+            if len(rows) > 200:
+                tail = f"<div style='margin-top:8px;color:#666'>（僅顯示前 200 筆；實際 {len(rows)} 筆）</div>"
+            else:
+                tail = ""
+            body = f"""
+            <table>
+              <thead>
+                <tr>
+                  <th style="text-align:left">名稱 (代號)</th>
+                  <th style="text-align:right">收盤</th>
+                  <th style="text-align:right">MA5</th>
+                  <th style="text-align:right">MA10</th>
+                  <th style="text-align:right">MA20</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trs}
+              </tbody>
+            </table>
+            {tail}
+            """
+        return f"<h2>{title}</h2>{body}"
 
-    # 分層
-    for layer in ["E", "B", "C", "D", "Z"]:
-        df_layer = layers[layers["layer"] == layer].sort_values(["market", "code"])
-        html.append(_table(df_layer, f"{layer} 層"))
+    html = f"""
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>每日分層報表</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", Arial, sans-serif; margin: 28px; color:#111; }}
+    h1 {{ font-size: 44px; margin: 0 0 10px 0; }}
+    .date {{ font-size: 18px; color:#333; margin-bottom: 18px; }}
+    h2 {{ font-size: 28px; margin-top: 30px; }}
+    ul {{ line-height: 1.6; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
+    th, td {{ border-bottom: 1px solid #eee; padding: 10px 8px; }}
+    th {{ background: #fafafa; }}
+    .note {{ margin-top: 26px; color:#666; border-top: 1px solid #eee; padding-top: 12px; }}
+  </style>
+</head>
+<body>
+  <h1>每日分層報表</h1>
+  <div class="date">日期：{report_date}（{TZ}）</div>
 
-    html.append("<hr>")
-    html.append("<p style='color:#666'>註：初版先以 TWSE + MA5/10/20 讓分層「可用可看」。後續再逐步加入 TPEx、MA60/240、RS、營收與規則全文。</p>")
-    html.append("</body></html>")
-    return "\n".join(html)
+  {err_html}
+
+  {section("WARMUP（資料不足，不算 Z）", "WARMUP")}
+  {section("E 層", "E")}
+  {section("B 層", "B")}
+  {section("C 層", "C")}
+  {section("D 層", "D")}
+  {section("Z 層", "Z")}
+
+  <div class="note">
+    註：初版先以 TWSE + MA5/10/20 讓分層「可用可看」。後續再加入 TPEx、MA60/240、RS、營收與規則全文。
+  </div>
+</body>
+</html>
+"""
+    return html
 
 
-# =============================
+# =========================================
 # Main
-# =============================
+# =========================================
 def main() -> int:
-    os.makedirs("docs", exist_ok=True)
-    os.makedirs("outputs", exist_ok=True)
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    os.makedirs(DOCS_DIR, exist_ok=True)
 
-    today = pd.Timestamp(dt.datetime.now().date())
-    date_str = today.strftime("%Y-%m-%d")
+    # 以台北日期為準
+    report_date = _now_taipei_date()
+    today = pd.Timestamp(report_date)
 
     errors: List[str] = []
-    warnings: List[str] = []
 
-    # 1) 取 TWSE 今日資料
-    twse = fetch_twse_daily_all(None)
-    if not twse.ok or twse.df.empty:
-        errors.append(f"TWSE 取得失敗：{twse.error}")
-        # 仍輸出空報表避免 Pages 空白
-        empty = pd.DataFrame(columns=["market", "code", "name", "close", "layer", "reason"])
-        html = build_html_report(date_str, empty, warnings, errors)
-        with open(OUT_HTML, "w", encoding="utf-8") as f:
-            f.write(html)
-        return 0
-
-    warnings.append("🟢 MVP：目前只跑 TWSE（TPEx 暫停）")
-
-    # 2) 載入歷史
+    # 讀舊歷史
     hist = load_history()
 
-    # 3) 回補歷史（加速 MA20 成形）
-    hist, filled = backfill_twse_recent_days(hist, today, BACKFILL_DAYS)
-    warnings.append(f"🟢 TWSE 回補：成功補到 {filled} 天（目標 {BACKFILL_DAYS}）")
+    # 先抓「今日」（或最新）資料
+    r_today = fetch_twse_daily_all(today)
+    if not r_today.ok:
+        errors.append(f"TWSE 今日取得失敗：{r_today.error}")
+    else:
+        hist = append_day(hist, r_today.df, today)
 
-    # 4) 寫入今日
-    hist = append_day(hist, twse.df, today)
-    hist.to_csv(HISTORY_PATH, index=False, encoding="utf-8")
+    # 回補
+    hist, backfill_errors = backfill_twse_recent_days(hist, today, BACKFILL_DAYS)
+    # backfill_errors 太多會刷版，先放摘要
+    if backfill_errors:
+        errors.append(f"TWSE 回補：失敗 {len(backfill_errors)} 次（MVP 先忽略細節）")
 
-    # 5) 算指標
-    hist_ind = compute_indicators(hist)
+    # 算 MA
+    hist_ma = compute_mas(hist)
 
-    # 6) 取今日切片
-    today_ind = hist_ind[hist_ind["date"] == today].copy()
-    if today_ind.empty:
-        errors.append("今日指標資料為空（可能日期寫入失敗）")
-        empty = pd.DataFrame(columns=["market", "code", "name", "close", "layer", "reason"])
-        html = build_html_report(date_str, empty, warnings, errors)
-        with open(OUT_HTML, "w", encoding="utf-8") as f:
-            f.write(html)
-        return 0
+    # 分層
+    layers, meta = layer_today(hist_ma, today)
 
-    # 7) 分層
-    out_rows = []
-    for _, row in today_ind.iterrows():
-        layer, reason = layer_logic(row)
-        out_rows.append({
-            "market": row.get("market", ""),
-            "code": str(row.get("code", "")).strip(),
-            "name": row.get("name", ""),
-            "close": row.get("close", ""),
-            "layer": layer,
-            "reason": reason,
-        })
-    layers = pd.DataFrame(out_rows)
+    # 存歷史
+    save_history(hist)
 
-    # 8) 摘要統計（讓你爽：一眼看到有沒有分層）
-    cnt = layers["layer"].value_counts().to_dict()
-    warnings.append("📊 分佈：" + " / ".join([f"{k}:{v}" for k, v in cnt.items()]))
+    # 產 HTML（同時寫 outputs/ 與 docs/）
+    html = render_html(report_date, errors, layers, meta)
 
-    # 9) 輸出 HTML
-    html = build_html_report(date_str, layers, warnings, errors)
-    with open(OUT_HTML, "w", encoding="utf-8") as f:
+    with open(HTML_PATH_OUTPUTS, "w", encoding="utf-8") as f:
+        f.write(html)
+    with open(HTML_PATH_DOCS, "w", encoding="utf-8") as f:
         f.write(html)
 
+    print("OK: wrote reports to outputs/index.html and docs/index.html")
     return 0
 
 
