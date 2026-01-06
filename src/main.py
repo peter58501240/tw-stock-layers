@@ -316,12 +316,7 @@ def layer_today(history_ma: pd.DataFrame, today: pd.Timestamp) -> Tuple[dict, di
         x["name"] = x["name"].fillna("")
         return x[["code", "name", "close", "ma5", "ma10", "ma20"]].to_dict(orient="records")
 
-    E = ready[(ready["close"] > ready["ma5"])_jobsafe(ready, "ma5") &
-              (ready["ma5"] > ready["ma10"])_jobsafe(ready, "ma10") &
-              (ready["ma10"] > ready["ma20"])_jobsafe(ready, "ma20")].copy()
-
-    # 上面那段如果遇到 nan 會出 warning；我們用函數避免
-    # 但 pandas 無法直接用自定義運算子，所以下面改用更安全的寫法
+    # 修正：使用安全的比較方式
     E = ready[
         (ready["close"] > ready["ma5"]) &
         (ready["ma5"] > ready["ma10"]) &
